@@ -1,4 +1,4 @@
-"""A simple tool-using AI agent built with LangGraph and a cheap OpenRouter model."""
+"""A simple tool-using AI agent built with LangGraph and free OpenRouter models."""
 
 import ast
 import operator
@@ -58,11 +58,26 @@ TOOLS = [calculator, current_time]
 
 # --- Model (OpenRouter is OpenAI-compatible) ---------------------------------
 
+# Free (":free") models that support tool calling. Free models are rate-limited,
+# so OpenRouter automatically falls back to the next model in the list.
+DEFAULT_MODEL = "google/gemma-4-31b-it:free"
+DEFAULT_FALLBACKS = "nvidia/nemotron-3-ultra-550b-a55b:free,google/gemma-4-26b-a4b-it:free"
+
+MODEL = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
+FALLBACKS = [
+    m.strip()
+    for m in os.getenv("OPENROUTER_FALLBACK_MODELS", DEFAULT_FALLBACKS).split(",")
+    if m.strip()
+]
+
 llm = ChatOpenAI(
-    model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+    model=MODEL,
     api_key=os.environ["OPENROUTER_API_KEY"],
     base_url="https://openrouter.ai/api/v1",
     temperature=0,
+    max_retries=3,
+    # OpenRouter-specific: try these models in order if the primary one fails.
+    extra_body={"models": [MODEL, *FALLBACKS]},
 ).bind_tools(TOOLS)
 
 SYSTEM_PROMPT = SystemMessage(
@@ -90,7 +105,7 @@ graph = builder.compile(checkpointer=MemorySaver())  # memory keeps chat history
 
 def main():
     config = {"configurable": {"thread_id": "cli"}}
-    print("Agent ready. Type 'exit' to quit.")
+    print(f"Agent ready (model: {MODEL}). Type 'exit' to quit.")
     while True:
         try:
             user_input = input("\nYou: ").strip()
@@ -100,8 +115,14 @@ def main():
             break
         if not user_input:
             continue
-        result = graph.invoke({"messages": [HumanMessage(user_input)]}, config)
-        print(f"Agent: {result['messages'][-1].content}")
+        try:
+            result = graph.invoke({"messages": [HumanMessage(user_input)]}, config)
+        except Exception as exc:  # noqa: BLE001 - e.g. free-tier rate limit (429)
+            print(f"Error: {exc}\nFree models are rate-limited; wait a bit and retry.")
+            continue
+        last = result["messages"][-1]
+        used = last.response_metadata.get("model_name", MODEL)
+        print(f"Agent ({used}): {last.content}")
 
 
 if __name__ == "__main__":
